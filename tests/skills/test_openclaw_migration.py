@@ -731,6 +731,51 @@ def test_cron_store_is_archived_without_config_cron_section(tmp_path: Path):
     assert "archive/cron-config.json" not in notes_text
 
 
+def test_plugins_archive_preserves_dangling_symlinks(tmp_path: Path):
+    """Archiving extensions should preserve broken node_modules/.bin symlinks."""
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    output_dir = target / "migration-report"
+    source.mkdir()
+    target.mkdir()
+
+    (source / "openclaw.json").write_text(
+        json.dumps({"plugins": {"entries": {"openclaw-qqbot": {}}}}),
+        encoding="utf-8",
+    )
+    bin_dir = source / "extensions" / "openclaw-qqbot" / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    broken_link = bin_dir / "openclaw"
+    broken_link.symlink_to("../openclaw/bin/openclaw.js")
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=output_dir,
+        selected_options={"plugins-config"},
+    )
+    report = migrator.migrate()
+
+    archived_link = output_dir / "archive" / "extensions" / "openclaw-qqbot" / "node_modules" / ".bin" / "openclaw"
+    assert archived_link.is_symlink()
+    assert archived_link.readlink() == Path("../openclaw/bin/openclaw.js")
+    archived_extension = next(
+        (
+            item for item in report["items"]
+            if item["kind"] == "plugins-config"
+            and item["destination"]
+            and item["destination"].endswith("archive/extensions")
+        ),
+        None,
+    )
+    assert archived_extension is not None
+
+
 def test_skill_installs_cleanly_under_skills_guard():
     skills_guard = load_skills_guard()
     result = skills_guard.scan_skill(

@@ -368,12 +368,21 @@ def backup_existing(path: Path, backup_root: Path) -> Optional[Path]:
         return None
     rel = Path(*path.parts[1:]) if path.is_absolute() and len(path.parts) > 1 else path
     dest = backup_root / rel
-    ensure_parent(dest)
-    if path.is_dir():
-        shutil.copytree(path, dest, dirs_exist_ok=True)
-    else:
-        shutil.copy2(path, dest)
+    copy_path(path, dest, dirs_exist_ok=True, preserve_symlinks=True)
     return dest
+
+
+def copy_path(source: Path, dest: Path, *, dirs_exist_ok: bool = False, preserve_symlinks: bool = False) -> None:
+    ensure_parent(dest)
+    if source.is_dir() and not source.is_symlink():
+        shutil.copytree(
+            source,
+            dest,
+            dirs_exist_ok=dirs_exist_ok,
+            symlinks=preserve_symlinks,
+        )
+        return
+    shutil.copy2(source, dest, follow_symlinks=not preserve_symlinks)
 
 
 # ── Brand rewriting ─────────────────────────────────────────
@@ -1762,11 +1771,7 @@ class Migrator:
     def archive_path(self, source: Path, reason: str) -> None:
         destination = self.archive_dir / relative_label(source, self.source_root) if self.archive_dir else None
         if self.execute and destination is not None:
-            ensure_parent(destination)
-            if source.is_dir():
-                shutil.copytree(source, destination, dirs_exist_ok=True)
-            else:
-                shutil.copy2(source, destination)
+            copy_path(source, destination, dirs_exist_ok=True, preserve_symlinks=True)
             self.record("archive", source, destination, "archived", reason)
         else:
             self.record("archive", source, destination, "archived", reason)
@@ -1871,7 +1876,7 @@ class Migrator:
         if ext_dir.is_dir() and self.archive_dir:
             dest_ext = self.archive_dir / "extensions"
             if self.execute:
-                shutil.copytree(ext_dir, dest_ext, dirs_exist_ok=True)
+                copy_path(ext_dir, dest_ext, dirs_exist_ok=True, preserve_symlinks=True)
             self.record("plugins-config", str(ext_dir), str(dest_ext), "archived",
                         "Extensions directory archived")
 
@@ -1910,7 +1915,7 @@ class Migrator:
             found_any = True
             dest_cron = self.archive_dir / "cron-store"
             if self.execute:
-                shutil.copytree(cron_store, dest_cron, dirs_exist_ok=True)
+                copy_path(cron_store, dest_cron, dirs_exist_ok=True, preserve_symlinks=True)
             self.record("cron-jobs", str(cron_store), str(dest_cron), "archived",
                         "Cron job store archived")
 
@@ -1942,7 +1947,7 @@ class Migrator:
             if hooks_dir.is_dir() and self.archive_dir:
                 dest_hooks = self.archive_dir / "workspace-hooks"
                 if self.execute:
-                    shutil.copytree(hooks_dir, dest_hooks, dirs_exist_ok=True)
+                    copy_path(hooks_dir, dest_hooks, dirs_exist_ok=True, preserve_symlinks=True)
                 self.record("hooks-config", str(hooks_dir), str(dest_hooks), "archived",
                             "Workspace hooks directory archived")
                 break
