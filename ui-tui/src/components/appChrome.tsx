@@ -5,6 +5,7 @@ import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
 import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
+import { $isStatusRuleOccluded } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { DEV_CREDITS_MODE } from '../config/env.js'
 import { FACES } from '../content/faces.js'
@@ -122,6 +123,7 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
   const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000))
   const [verbTick, setVerbTick] = useState(() => Math.floor(Math.random() * VERBS.length))
   const [now, setNow] = useState(() => Date.now())
+  const isOccluded = useStore($isStatusRuleOccluded)
 
   // Pre-compute cadence + verb-visibility for the active style so an
   // `/indicator` switch re-arms the interval (and skips the verb timer
@@ -130,6 +132,19 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
   const { intervalMs, showVerb } = renderIndicator(style, 0)
 
   useEffect(() => {
+    // An overlay is painted OVER the status rule (the modal widget slot, or a
+    // floating panel growing up over the top rule), so every tick below is a
+    // re-render nobody can see — in an Ink TUI that churn reads as the dialog
+    // tearing.  Arm nothing while occluded.  The effect re-runs when the rule
+    // is revealed again and re-seeds `now` from the wall clock, so the elapsed
+    // read-out resumes live rather than frozen at the moment it was covered.
+    // See `$isStatusRuleOccluded` for why this is NOT `$isBlocked`.
+    if (isOccluded) {
+      return
+    }
+
+    setNow(Date.now())
+
     const glyph = setInterval(() => setTick(n => n + 1), intervalMs)
     const clock = setInterval(() => setNow(Date.now()), 1000)
     // Verb timer is gated on `showVerb` — `unicode` style hides the verb
@@ -144,7 +159,7 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
         clearInterval(verb)
       }
     }
-  }, [intervalMs, showVerb])
+  }, [intervalMs, isOccluded, showVerb])
 
   const { frame } = renderIndicator(style, tick)
   const verb = VERBS[verbTick % VERBS.length] ?? ''
@@ -276,10 +291,13 @@ export function statusRuleWidths(cols: number, cwdLabel: string, minLeftContent 
 export interface StatusBarSegments {
   bar: boolean
   bg: boolean
+  cacheHit: boolean
   compactCtx: boolean
   compressions: boolean
   duration: boolean
+  latency: boolean
   subagents: boolean
+  tps: boolean
   voice: boolean
 }
 
@@ -293,7 +311,10 @@ export function statusBarSegments(cols: number): StatusBarSegments {
     compressions: w >= 80,
     voice: w >= 84,
     bg: w >= 88,
-    subagents: w >= 92
+    subagents: w >= 92,
+    cacheHit: w >= 96,
+    latency: w >= 104,
+    tps: w >= 110
   }
 }
 
@@ -360,13 +381,21 @@ function SpawnHud({ t }: { t: Theme }) {
 
 function SessionDuration({ startedAt }: { startedAt: number }) {
   const [now, setNow] = useState(() => Date.now())
+  const isOccluded = useStore($isStatusRuleOccluded)
 
   useEffect(() => {
+    // Paused only while an overlay actually covers the status rule — see
+    // FaceTicker.  The `setNow` below already re-seeds from the wall clock
+    // on every re-arm, so it doubles as the reveal catch-up.
+    if (isOccluded) {
+      return
+    }
+
     setNow(Date.now())
     const id = setInterval(() => setNow(Date.now()), 1000)
 
     return () => clearInterval(id)
-  }, [startedAt])
+  }, [isOccluded, startedAt])
 
   return fmtDuration(now - startedAt)
 }
@@ -375,13 +404,21 @@ function IdleSince({ endedAt }: { endedAt: number }) {
   // Time since the last final agent response. Re-ticks every second like
   // SessionDuration so the read-out stays live while the session idles.
   const [now, setNow] = useState(() => Date.now())
+  const isOccluded = useStore($isStatusRuleOccluded)
 
   useEffect(() => {
+    // Paused only while an overlay actually covers the status rule — see
+    // FaceTicker.  The `setNow` below re-seeds from the wall clock on reveal
+    // so the idle read-out is not frozen when the overlay closes.
+    if (isOccluded) {
+      return
+    }
+
     setNow(Date.now())
     const id = setInterval(() => setNow(Date.now()), 1000)
 
     return () => clearInterval(id)
-  }, [endedAt])
+  }, [endedAt, isOccluded])
 
   return `✓ ${fmtDuration(now - endedAt)}`
 }
@@ -439,6 +476,7 @@ export function StatusRule({
   cols,
   busy,
   status,
+  statusBarFields = null,
   statusColor,
   model,
   modelFast,
@@ -449,6 +487,7 @@ export function StatusRule({
   bgCount,
   lastTurnEndedAt,
   liveSessionCount,
+  sessionTitle,
   sessionStartedAt,
   turnStartedAt,
   voiceLabel,
@@ -459,21 +498,28 @@ export function StatusRule({
   const barColor = ctxBarColor(pct, t)
   const segs = statusBarSegments(cols)
 
+  // display.status_bar.fields visibility gate (same key + names as the
+  // classic CLI bar). null = user hasn't customized → everything shows.
+  const ok = (name: string) => statusBarFields === null || statusBarFields.has(name)
+
   // On narrow terminals the context read-out collapses to a bare token count
   // (`12k tok`) and the visual fill bar is dropped entirely.
-  const ctxLabel = usage.context_max
-    ? segs.compactCtx
-      ? `${fmtK(usage.context_used ?? 0)} tok`
-      : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-    : usage.total > 0
-      ? `${fmtK(usage.total)} tok`
+  const ctxLabel =
+    ok('context_detail') || ok('context_pct')
+      ? usage.context_max
+        ? segs.compactCtx
+          ? `${fmtK(usage.context_used ?? 0)} tok`
+          : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+        : usage.total > 0
+          ? `${fmtK(usage.total)} tok`
+          : ''
       : ''
 
-  const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
+  const bar = !segs.compactCtx && usage.context_max && ok('context_pct') ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
-  const showBattery = !!battery && battery.available && battery.percent != null
+  const showBattery = !!battery && battery.available && battery.percent != null && ok('battery')
   const batteryText = showBattery ? batteryLabel(battery!) : ''
   const batteryColorVal = showBattery ? batteryColor(battery!, t) : ''
   const batteryWidth = showBattery ? stringWidth(`${batteryText} │ `) : 0
@@ -509,7 +555,8 @@ export function StatusRule({
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, cwdLabel, essentialWidth)
+  const rightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials, evaluated in
@@ -542,7 +589,7 @@ export function StatusRule({
       : ''
 
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
-  const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
+  const showDuration = segs.duration && ok('duration') && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
 
   // Idle clock — time since the last final agent response. Hidden while busy
   // (the FaceTicker's elapsed tail covers the live turn) and before the first
@@ -550,12 +597,26 @@ export function StatusRule({
   const showIdle =
     segs.duration && !busy && lastTurnEndedAt != null && fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
 
-  const showCompressions = segs.compressions && compressions > 0 && fits(SEP + stringWidth(`cmp ${compressions}`))
-  const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
+  const showCompressions =
+    segs.compressions && ok('compressions') && compressions > 0 && fits(SEP + stringWidth(`cmp ${compressions}`))
+
+  // Cache-hit % + rolling latency / tokens-per-sec — mirrored from the classic
+  // CLI bar (PR #98250). The server omits the keys when no data exists (zero
+  // cache reads, Codex app-server with no latency), so these self-hide.
+  const cacheHitText = typeof usage.cache_hit_pct === 'number' ? `◎ ${usage.cache_hit_pct}%` : ''
+  const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
+  const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
+  const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
+  const tpsText = typeof usage.avg_tps === 'number' ? `↑ ${Math.round(usage.avg_tps)} t/s` : ''
+  const showTps = segs.tps && ok('tps') && !!tpsText && fits(SEP + stringWidth(tpsText))
+
+  const showVoice = segs.voice && ok('voice') && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
   const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
-  const showBg = segs.bg && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
+  const showBg = segs.bg && ok('bg_tasks') && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
   const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
-  const showSubagents = segs.subagents && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
+
+  const showSubagents =
+    segs.subagents && ok('bg_subagents') && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
 
   // Parked-background reassurance: a top-level delegate_task runs in the
   // background, so the turn ends (idle) while the subagent keeps working and its
@@ -672,6 +733,34 @@ export function StatusRule({
             </Text>
           </Text>
         ) : null}
+        {showCacheHit ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            <Text
+              color={
+                usage.cache_hit_pct! >= 70
+                  ? t.color.statusGood
+                  : usage.cache_hit_pct! >= 40
+                    ? t.color.statusWarn
+                    : t.color.muted
+              }
+            >
+              {cacheHitText}
+            </Text>
+          </Text>
+        ) : null}
+        {showLatency ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {latencyText}
+          </Text>
+        ) : null}
+        {showTps ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            {tpsText}
+          </Text>
+        ) : null}
         {showVoice ? (
           <Text
             color={
@@ -717,8 +806,8 @@ export function StatusRule({
         <>
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
           <Box flexShrink={0} width={rightWidth}>
-            <Text color={t.color.label} wrap="truncate-end">
-              {cwdLabel}
+            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+              {rightLabel}
             </Text>
           </Box>
         </>
@@ -837,7 +926,11 @@ interface StatusRuleProps {
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
   sessionStartedAt?: null | number
+  sessionTitle?: string
   status: string
+  // display.status_bar.fields — segment visibility filter shared with the
+  // classic CLI bar. null = defaults (everything shows).
+  statusBarFields?: null | ReadonlySet<string>
   statusColor: string
   t: Theme
   turnStartedAt?: null | number
